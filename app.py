@@ -6,136 +6,142 @@ from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 import math
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="AI Route Optimizer", layout="wide")
-
+# --- CONFIG ---
+st.set_page_config(page_title="Logistics AI", layout="wide")
 st.title("🚛 AI Last-Mile Delivery Optimizer")
-st.markdown("Upload your delivery orders, set vehicle limits, and let AI find the best path.")
 
-# --- SIDEBAR INPUTS ---
+# --- SIDEBAR ---
 with st.sidebar:
-    st.header("1. Upload Data")
-    uploaded_file = st.file_uploader("Upload CSV (Columns: lat, lon, demand)", type=["csv"])
+    st.header("Input Parameters")
+    uploaded_file = st.file_uploader("Upload 'final_delivery_data.csv'", type=["csv"])
     
-    st.header("2. Fleet Settings")
+    st.divider()
     num_vehicles = st.slider("Number of Vehicles", 1, 10, 4)
-    vehicle_capacity = st.slider("Vehicle Capacity (Items)", 10, 100, 20)
+    vehicle_capacity = st.slider("Vehicle Capacity", 10, 100, 25)
     
-    st.header("3. Run AI")
-    run_btn = st.button("Optimize Routes")
+    run_btn = st.button("🚀 Optimize Route", type="primary")
 
-# --- MATH FUNCTIONS (The "Brain") ---
+# --- HELPER FUNCTIONS ---
 def calculate_distance(lat1, lon1, lat2, lon2):
-    # Haversine formula for distance between coords
-    R = 6371  # Earth radius in km
+    R = 6371  # Earth radius km
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat/2) * math.sin(dlat/2) + \
         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * \
         math.sin(dlon/2) * math.sin(dlon/2)
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return R * c * 1000 # Return in meters
+    return int(R * c * 1000) # Meters
 
-def create_data_model(df, num_vehicles, capacity):
-    data = {}
-    # Distance Matrix
+def solve_vrp(df, num_vehicles, cap):
+    # Data Model
     locs = df[['lat', 'lon']].values
+    names = df['Location_Name'].tolist()
+    demands = df['demand'].tolist()
     size = len(locs)
-    dist_matrix = [[0] * size for _ in range(size)]
+    
+    # Matrix
+    dist_matrix = [[0]*size for _ in range(size)]
     for i in range(size):
         for j in range(size):
-            dist_matrix[i][j] = int(calculate_distance(locs[i][0], locs[i][1], locs[j][0], locs[j][1]))
-    
-    data['distance_matrix'] = dist_matrix
-    data['demands'] = df['demand'].tolist()
-    data['num_vehicles'] = num_vehicles
-    data['vehicle_capacities'] = [capacity] * num_vehicles
-    data['depot'] = 0 # Assume first row is the warehouse
-    return data
-
-def solve_vrp(data):
-    manager = pywrapcp.RoutingIndexManager(len(data['distance_matrix']), data['num_vehicles'], data['depot'])
+            dist_matrix[i][j] = calculate_distance(locs[i][0], locs[i][1], locs[j][0], locs[j][1])
+            
+    # OR-Tools
+    manager = pywrapcp.RoutingIndexManager(size, num_vehicles, 0)
     routing = pywrapcp.RoutingModel(manager)
+    
+    def dist_cb(i, j):
+        return dist_matrix[manager.IndexToNode(i)][manager.IndexToNode(j)]
+    
+    transit_cb = routing.RegisterTransitCallback(dist_cb)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_cb)
+    
+    def demand_cb(i):
+        return demands[manager.IndexToNode(i)]
+    
+    demand_cb_idx = routing.RegisterUnaryTransitCallback(demand_cb)
+    routing.AddDimensionWithVehicleCapacity(demand_cb_idx, 0, [cap]*num_vehicles, True, 'Capacity')
+    
+    params = pywrapcp.DefaultRoutingSearchParameters()
+    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    
+    solution = routing.SolveWithParameters(params)
+    return solution, routing, manager, dist_matrix
 
-    # Distance Constraint
-    def distance_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        return data['distance_matrix'][from_node][to_node]
-    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
-
-    # Capacity Constraint
-    def demand_callback(from_index):
-        from_node = manager.IndexToNode(from_index)
-        return data['demands'][from_node]
-    demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
-    routing.AddDimensionWithVehicleCapacity(
-        demand_callback_index, 0, data['vehicle_capacities'], True, 'Capacity')
-
-    # Solve
-    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = (routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
-    solution = routing.SolveWithParameters(search_parameters)
-    return solution, routing, manager
-
-# --- APP LOGIC ---
-if uploaded_file is not None:
+# --- MAIN APP ---
+if uploaded_file:
     df = pd.read_csv(uploaded_file)
     
-    # Show Raw Data
+    # Layout: Map on Right, Stats on Left
     col1, col2 = st.columns([1, 2])
+    
     with col1:
-        st.subheader("Order Data")
-        st.dataframe(df.head())
-        st.info(f"Total Orders: {len(df)}")
-    
-    # Initialize Map
-    m = folium.Map(location=[df.iloc[0]['lat'], df.iloc[0]['lon']], zoom_start=11)
-    
-    # Plot Customer Locations (Before Opt)
-    for _, row in df.iterrows():
-        folium.CircleMarker(
-            location=[row['lat'], row['lon']],
-            radius=5, color="blue", fill=True, fill_color="blue"
+        st.subheader("📍 Orders")
+        st.dataframe(df[['Location_Name', 'demand']].head(10), height=200)
+        st.caption("showing first 10 orders")
+
+    # Base Map
+    mid_lat = df['lat'].mean()
+    mid_lon = df['lon'].mean()
+    m = folium.Map(location=[mid_lat, mid_lon], zoom_start=13, tiles="cartodbpositron")
+
+    # Add Points (Before Optimization)
+    for i, row in df.iterrows():
+        # Depot is red, others blue
+        color = "red" if i == 0 else "blue"
+        icon = "home" if i == 0 else "info-sign"
+        
+        folium.Marker(
+            [row['lat'], row['lon']],
+            popup=f"<b>{row['Location_Name']}</b><br>{row['Address']}",
+            tooltip=row['Location_Name'],
+            icon=folium.Icon(color=color, icon=icon)
         ).add_to(m)
-    
-    # Plot Warehouse (First Row)
-    folium.Marker(
-        location=[df.iloc[0]['lat'], df.iloc[0]['lon']],
-        icon=folium.Icon(color="red", icon="home"),
-        tooltip="Warehouse"
-    ).add_to(m)
 
     if run_btn:
-        with st.spinner("AI is calculating optimal routes..."):
-            data = create_data_model(df, num_vehicles, vehicle_capacity)
-            solution, routing, manager = solve_vrp(data)
+        solution, routing, manager, dist_matrix = solve_vrp(df, num_vehicles, vehicle_capacity)
+        
+        if solution:
+            total_dist = 0
+            colors = ['#e6194B', '#3cb44b', '#ffe119', '#4363d8', '#f58231']
             
-            if solution:
-                st.success("Routes Optimized!")
+            with col1:
+                st.success("✅ Optimization Complete!")
+            
+            # Draw Routes
+            for vehicle_id in range(num_vehicles):
+                index = routing.Start(vehicle_id)
+                coords = []
+                route_dist = 0
                 
-                # Colors for different vehicles
-                colors = ['red', 'blue', 'green', 'purple', 'orange', 'darkred', 'lightred', 'beige', 'darkblue', 'darkgreen']
-                
-                total_distance = 0
-                
-                # Draw Routes
-                for vehicle_id in range(data['num_vehicles']):
-                    index = routing.Start(vehicle_id)
-                    route_coords = []
-                    while not routing.IsEnd(index):
-                        node_index = manager.IndexToNode(index)
-                        route_coords.append([df.iloc[node_index]['lat'], df.iloc[node_index]['lon']])
-                        index = solution.Value(routing.NextVar(index))
-                    # Add end point
-                    node_index = manager.IndexToNode(index)
-                    route_coords.append([df.iloc[node_index]['lat'], df.iloc[node_index]['lon']])
+                while not routing.IsEnd(index):
+                    node = manager.IndexToNode(index)
+                    coords.append([df.iloc[node]['lat'], df.iloc[node]['lon']])
                     
-                    # Plot line
-                    folium.PolyLine(route_coords, color=colors[vehicle_id % len(colors)], weight=4, opacity=0.8).add_to(m)
-            else:
-                st.error("No solution found. Try increasing vehicle capacity or number of vehicles.")
+                    prev_index = index
+                    index = solution.Value(routing.NextVar(index))
+                    route_dist += routing.GetArcCostForVehicle(prev_index, index, vehicle_id)
+                
+                # Add return to depot
+                node = manager.IndexToNode(index)
+                coords.append([df.iloc[node]['lat'], df.iloc[node]['lon']])
+                
+                total_dist += route_dist
+                
+                # Plot
+                folium.PolyLine(
+                    coords, 
+                    color=colors[vehicle_id % len(colors)], 
+                    weight=5, 
+                    opacity=0.8,
+                    tooltip=f"Vehicle {vehicle_id+1}"
+                ).add_to(m)
+
+            # Display Big Metrics
+            col1.metric("Total Distance (Optimized)", f"{total_dist/1000:.2f} km")
+            col1.metric("Vehicles Used", num_vehicles)
+
+        else:
+            st.error("Could not find a solution. Try increasing Vehicle Capacity.")
 
     with col2:
-        st_folium(m, width=700, height=500)
+        st_folium(m, width=800, height=600)
