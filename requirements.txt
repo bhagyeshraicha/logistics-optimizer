@@ -2,5 +2,4 @@ streamlit
 pandas
 folium
 streamlit-folium
-ortools>=9.12.4544
 numpy
