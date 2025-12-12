@@ -2,5 +2,6 @@ streamlit
 pandas
 folium
 streamlit-folium
-ortools
+ortools==9.6.2534
+protobuf==3.20.3
 numpy
