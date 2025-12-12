@@ -2,168 +2,136 @@ import streamlit as st
 import pandas as pd
 import folium
 from streamlit_folium import st_folium
-from ortools.constraint_solver import routing_enums_pb2
-from ortools.constraint_solver import pywrapcp
 import math
+import numpy as np
 
 # --- CONFIG ---
-st.set_page_config(page_title="Logistics AI", layout="wide")
+st.set_page_config(page_title="Logistics AI (Lite)", layout="wide")
 st.title("🚛 AI Last-Mile Delivery Optimizer")
+st.markdown("### Fast Route Optimization System")
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("Input Parameters")
-    uploaded_file = st.file_uploader("Upload 'final_delivery_data.csv'", type=["csv"])
+    st.header("1. Upload Data")
+    uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
     
-    st.divider()
+    st.header("2. Settings")
     num_vehicles = st.slider("Number of Vehicles", 1, 10, 4)
-    vehicle_capacity = st.slider("Vehicle Capacity", 10, 100, 25)
+    st.info("Using Nearest-Neighbor Algorithm for instant results.")
     
-    run_btn = st.button("🚀 Optimize Route", type="primary")
+    run_btn = st.button("🚀 Optimize Now", type="primary")
 
-# --- HELPER FUNCTIONS ---
-def calculate_distance(lat1, lon1, lat2, lon2):
-    R = 6371  # Earth radius km
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat/2) * math.sin(dlat/2) + \
-        math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * \
-        math.sin(dlon/2) * math.sin(dlon/2)
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return int(R * c * 1000) # Meters
+# --- FAST ALGORITHM (No Heavy Libraries) ---
+def get_dist(p1, p2):
+    # Simple Euclidean approximation for speed (sufficient for local cities)
+    # or Haversine if you prefer. Using simple deg diff for max speed here.
+    return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
-def solve_vrp(df, num_vehicles, cap):
-    # Data Model
-    locs = df[['lat', 'lon']].values
-    names = df['Location_Name'].tolist()
-    demands = df['demand'].tolist()
-    size = len(locs)
+def solve_fast_vrp(df, num_vehicles):
+    # Convert dataframe to list of [lat, lon, name]
+    points = df[['lat', 'lon', 'Location_Name']].values.tolist()
     
-    # Matrix
-    dist_matrix = [[0]*size for _ in range(size)]
-    for i in range(size):
-        for j in range(size):
-            dist_matrix[i][j] = calculate_distance(locs[i][0], locs[i][1], locs[j][0], locs[j][1])
+    depot = points[0] # First row is Warehouse
+    customers = points[1:]
+    
+    # 1. Cluster customers based on angle/location to split among vehicles
+    # We sort by longitude to sweep across the city
+    customers.sort(key=lambda x: x[1])
+    
+    # Split into chunks for each vehicle
+    chunk_size = math.ceil(len(customers) / num_vehicles)
+    vehicle_routes = []
+    
+    for i in range(num_vehicles):
+        start_idx = i * chunk_size
+        end_idx = start_idx + chunk_size
+        chunk = customers[start_idx:end_idx]
+        
+        if not chunk:
+            continue
             
-    # OR-Tools
-    manager = pywrapcp.RoutingIndexManager(size, num_vehicles, 0)
-    routing = pywrapcp.RoutingModel(manager)
-    
-    def dist_cb(i, j):
-        return dist_matrix[manager.IndexToNode(i)][manager.IndexToNode(j)]
-    
-    transit_cb = routing.RegisterTransitCallback(dist_cb)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_cb)
-    
-    def demand_cb(i):
-        return demands[manager.IndexToNode(i)]
-    
-    demand_cb_idx = routing.RegisterUnaryTransitCallback(demand_cb)
-    routing.AddDimensionWithVehicleCapacity(demand_cb_idx, 0, [cap]*num_vehicles, True, 'Capacity')
-    
-    params = pywrapcp.DefaultRoutingSearchParameters()
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    
-    solution = routing.SolveWithParameters(params)
-    return solution, routing, manager, dist_matrix
+        # 2. Optimize the route for this vehicle (Nearest Neighbor)
+        route = [depot]
+        unvisited = chunk.copy()
+        current_loc = depot
+        
+        while unvisited:
+            # Find closest next stop
+            nearest = min(unvisited, key=lambda x: get_dist(current_loc, x))
+            route.append(nearest)
+            unvisited.remove(nearest)
+            current_loc = nearest
+            
+        route.append(depot) # Return home
+        vehicle_routes.append(route)
+        
+    return vehicle_routes
 
 # --- MAIN APP ---
 if uploaded_file:
     try:
         df = pd.read_csv(uploaded_file)
         
-        # --- DATA CLEANING (THE FIX) ---
-        # 1. Ensure columns exist
-        required_cols = ['lat', 'lon', 'Location_Name', 'demand']
-        if not all(col in df.columns for col in required_cols):
-            st.error(f"Error: Your CSV must contain these columns: {required_cols}")
-            st.stop()
-            
-        # 2. Force numbers (Turn 'Unknown' into NaN)
+        # --- THE FIX FOR STRINGS ---
+        # This block forces everything to numbers and deletes bad rows
         df['lat'] = pd.to_numeric(df['lat'], errors='coerce')
         df['lon'] = pd.to_numeric(df['lon'], errors='coerce')
-        
-        # 3. Drop bad rows
-        old_len = len(df)
+        initial_count = len(df)
         df = df.dropna(subset=['lat', 'lon'])
-        if len(df) < old_len:
-            st.warning(f"Removed {old_len - len(df)} rows with invalid coordinates.")
+        
+        if len(df) < initial_count:
+            st.warning(f"Cleaned data: Removed {initial_count - len(df)} rows containing text/errors.")
+        
+        # ---------------------------
 
-        # Layout: Map on Right, Stats on Left
-        col1, col2 = st.columns([1, 2])
+        # Layout
+        col1, col2 = st.columns([1, 3])
         
         with col1:
-            st.subheader("📍 Orders")
-            st.dataframe(df[['Location_Name', 'demand']].head(10), height=200)
-            st.caption("showing first 10 orders")
+            st.subheader("📍 Data Preview")
+            st.dataframe(df[['Location_Name']].head(10), height=300)
+            st.caption(f"Total stops: {len(df)}")
 
-        # Base Map
+        # Map Setup
         mid_lat = df['lat'].mean()
         mid_lon = df['lon'].mean()
-        m = folium.Map(location=[mid_lat, mid_lon], zoom_start=13, tiles="cartodbpositron")
+        m = folium.Map(location=[mid_lat, mid_lon], zoom_start=12, tiles="cartodbpositron")
 
-        # Add Points (Before Optimization)
+        # Plot all points
         for i, row in df.iterrows():
-            # Depot is red, others blue
-            color = "red" if i == 0 else "blue"
-            icon = "home" if i == 0 else "info-sign"
+            color = "red" if i == 0 else "blue" # Warehouse = Red
+            icon = "home" if i == 0 else "map-marker"
             
             folium.Marker(
                 [row['lat'], row['lon']],
-                popup=f"<b>{row['Location_Name']}</b>",
-                tooltip=row['Location_Name'],
-                icon=folium.Icon(color=color, icon=icon)
+                popup=str(row['Location_Name']),
+                icon=folium.Icon(color=color, icon=icon, prefix='fa')
             ).add_to(m)
 
         if run_btn:
-            with st.spinner("Calculating optimal routes..."):
-                solution, routing, manager, dist_matrix = solve_vrp(df, num_vehicles, vehicle_capacity)
+            with st.spinner("Calculating..."):
+                routes = solve_fast_vrp(df, num_vehicles)
                 
-                if solution:
-                    total_dist = 0
-                    colors = ['#e6194B', '#3cb44b', '#ffe119', '#4363d8', '#f58231']
+                # Colors for lines
+                colors = ['red', 'blue', 'green', 'purple', 'orange', 'black']
+                
+                with col1:
+                    st.success(f"✅ Dispatched {len(routes)} Vehicles!")
+                
+                for i, route in enumerate(routes):
+                    # Extract just lat/lon for the line
+                    line_points = [[p[0], p[1]] for p in route]
                     
-                    with col1:
-                        st.success("✅ Optimization Complete!")
-                    
-                    # Draw Routes
-                    for vehicle_id in range(num_vehicles):
-                        index = routing.Start(vehicle_id)
-                        coords = []
-                        route_dist = 0
-                        
-                        while not routing.IsEnd(index):
-                            node = manager.IndexToNode(index)
-                            coords.append([df.iloc[node]['lat'], df.iloc[node]['lon']])
-                            
-                            prev_index = index
-                            index = solution.Value(routing.NextVar(index))
-                            route_dist += routing.GetArcCostForVehicle(prev_index, index, vehicle_id)
-                        
-                        # Add return to depot
-                        node = manager.IndexToNode(index)
-                        coords.append([df.iloc[node]['lat'], df.iloc[node]['lon']])
-                        
-                        total_dist += route_dist
-                        
-                        # Plot
-                        folium.PolyLine(
-                            coords, 
-                            color=colors[vehicle_id % len(colors)], 
-                            weight=5, 
-                            opacity=0.8,
-                            tooltip=f"Vehicle {vehicle_id+1}"
-                        ).add_to(m)
-
-                    # Display Big Metrics
-                    col1.metric("Total Distance (Optimized)", f"{total_dist/1000:.2f} km")
-                    col1.metric("Vehicles Used", num_vehicles)
-
-                else:
-                    st.error("Could not find a solution. Try increasing Vehicle Capacity.")
+                    folium.PolyLine(
+                        line_points, 
+                        color=colors[i % len(colors)], 
+                        weight=4, 
+                        opacity=0.8,
+                        tooltip=f"Vehicle {i+1}"
+                    ).add_to(m)
 
         with col2:
-            st_folium(m, width=800, height=600)
+            st_folium(m, width=900, height=600)
 
     except Exception as e:
-        st.error(f"An error occurred: {e}")
+        st.error(f"Something went wrong: {e}")
